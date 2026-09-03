@@ -3116,11 +3116,7 @@ def test_frozen_plan_runs_only_selected_bundle_without_triage_prompt_or_store(pr
     )
     engine, adapter = make_sweep(
         project,
-        [
-            bundle_dev_effect(
-                project, "selected", ["DW-1"], followup_review=False
-            )
-        ],
+        [bundle_dev_effect(project, "selected", ["DW-1"], followup_review=False)],
         frozen_plan=frozen_plan,
         frozen_answers={},
         repeat=True,
