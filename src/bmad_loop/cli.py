@@ -408,8 +408,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         channel = (
             "the ATTENTION file in the run directory is the only alert channel left"
             if pol.notify.file
-            else "notify.file is also off, so no alert channel is configured — "
-            "enable notify.file"
+            else "notify.file is also off, so no alert channel is configured — enable notify.file"
         )
         report.warn(
             "notify.desktop-unavailable",
