@@ -1104,6 +1104,10 @@ class RunState:
     # State and options are separate atomic files; this binding makes replacing
     # a targeted run's valid options with an unrestricted document fail closed.
     sweep_options_digest: str = ""
+    # True only for the atomic frozen-input sweep capability. Persisted outside
+    # sweep.json so a missing/corrupt options file cannot downgrade resume to an
+    # ordinary tolerant sweep.
+    filtered_sweep: bool = False
     # story-queue source (policy.StoriesPolicy.source), pinned at run start so
     # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
     # without re-reading policy — a policy edit mid-run must not switch a live run's
@@ -1285,6 +1289,7 @@ class RunState:
             "run_type": self.run_type,
             "sweep_options_version": self.sweep_options_version,
             "sweep_options_digest": self.sweep_options_digest,
+            **({"filtered_sweep": True} if self.filtered_sweep else {}),
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
@@ -1326,6 +1331,7 @@ class RunState:
             run_type=str(d.get("run_type", "story")),
             sweep_options_version=int(d.get("sweep_options_version", 0)),
             sweep_options_digest=str(d.get("sweep_options_digest", "")),
+            filtered_sweep=bool(d.get("filtered_sweep", False)),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),

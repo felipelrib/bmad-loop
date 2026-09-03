@@ -23,6 +23,7 @@ from . import (
     devcontract,
     envvars,
     events,
+    fanout,
     frontmatter,
     gates,
     install,
@@ -2795,6 +2796,7 @@ def _start_sweep(
     run_id: str | None = None,
     profiles=None,
     on_started: Callable[[], None] | None = None,
+    frozen_sweep: fanout.FrozenSweep | None = None,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
@@ -2827,6 +2829,7 @@ def _start_sweep(
         trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
         profiles=profiles,
         on_started=on_started,
+        frozen_sweep=frozen_sweep,
     )
     _warn_bypass_dropped(
         pol,
@@ -2957,11 +2960,15 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             or args.run_id is not None
             or only_arg is not None
             or min_severity is not None
+            or getattr(args, "fanout_schema", None) is not None
+            or getattr(args, "bundles", None) is not None
+            or getattr(args, "triage_file", None) is not None
+            or getattr(args, "decisions_file", None) is not None
         ):
             print(
                 "--archive cannot combine with --decisions-only, --repeat, "
                 "--max-bundles, --max-cycles, --no-prompt, --run-id, --only, "
-                "or --min-severity",
+                "--min-severity, or the fanout flags",
                 file=sys.stderr,
             )
             return ExitCode.FAILURE
@@ -2974,9 +2981,12 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         return ExitCode.FAILURE
 
     pol = policy_mod.load(_policy_path(project))
+    frozen_sweep = _fanout_preflight(args, paths)
 
     if args.dry_run:
-        return _sweep_dry_run(paths, pol, only_ids=only_ids, min_severity=min_severity)
+        return _sweep_dry_run(
+            paths, pol, only_ids=only_ids, min_severity=min_severity, frozen_sweep=frozen_sweep
+        )
 
     if (rc := _reject_under_floor_git(paths.project)) is not None:
         return rc
@@ -3000,15 +3010,16 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         project,
         paths,
         pol,
-        prompting=not args.no_prompt,
-        decisions_only=args.decisions_only,
-        max_bundles=args.max_bundles,
-        repeat=args.repeat,
-        max_cycles=args.max_cycles,
+        prompting=False if frozen_sweep is not None else not args.no_prompt,
+        decisions_only=False if frozen_sweep is not None else args.decisions_only,
+        max_bundles=None if frozen_sweep is not None else args.max_bundles,
+        repeat=False if frozen_sweep is not None else args.repeat,
+        max_cycles=1 if frozen_sweep is not None else args.max_cycles,
         only_ids=only_ids,
         min_severity=min_severity,
         trigger="cli",
         run_id=args.run_id,
+        frozen_sweep=frozen_sweep,
     )
 
 
@@ -3132,13 +3143,75 @@ def _parse_sweep_only(value: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(parts))
 
 
+def _fanout_preflight(
+    args: argparse.Namespace, paths: bmadconfig.ProjectPaths
+) -> fanout.FrozenSweep | None:
+    # `getattr`, like `cmd_sweep` reads `--only`: callers that build a Namespace by
+    # hand (tests, frontends) need not know the fanout group exists.
+    fanout_schema = getattr(args, "fanout_schema", None)
+    bundles = getattr(args, "bundles", None)
+    triage_file = getattr(args, "triage_file", None)
+    decisions_file = getattr(args, "decisions_file", None)
+    values = {
+        "--fanout-schema": fanout_schema,
+        "--bundles": bundles,
+        "--triage-file": triage_file,
+        "--decisions-file": decisions_file,
+    }
+    present = {name for name, value in values.items() if value is not None}
+    if not present:
+        return None
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise fanout.FanoutError("fanout flags are one atomic group; missing " + ", ".join(missing))
+    conflicts = []
+    if args.decisions_only:
+        conflicts.append("--decisions-only")
+    if args.max_bundles is not None:
+        conflicts.append("--max-bundles")
+    if args.repeat is not None:
+        conflicts.append("--repeat/--no-repeat")
+    if args.max_cycles is not None:
+        conflicts.append("--max-cycles")
+    if getattr(args, "only", None) is not None:
+        conflicts.append("--only")
+    if getattr(args, "min_severity", None) is not None:
+        conflicts.append("--min-severity")
+    if conflicts:
+        raise fanout.FanoutError(
+            "fanout mode conflicts with set-changing controls: " + ", ".join(conflicts)
+        )
+    # The `missing` refusal above is the proof; this only narrows for the checker.
+    assert (
+        fanout_schema is not None
+        and bundles is not None
+        and triage_file is not None
+        and decisions_file is not None
+    )
+    return fanout.load_frozen_sweep(
+        schema_version=fanout_schema,
+        bundle_keys=tuple(bundles),
+        triage_path=Path(triage_file),
+        decisions_path=Path(decisions_file),
+        ledger_path=paths.deferred_work,
+    )
+
+
 def _sweep_dry_run(
     paths: bmadconfig.ProjectPaths,
     pol,
     *,
     only_ids: tuple[str, ...] | None = None,
     min_severity: str | None = None,
+    frozen_sweep: fanout.FrozenSweep | None = None,
 ) -> int:
+    if frozen_sweep is not None:
+        print("filtered sweep: validated frozen schema 1 contract")
+        for key in frozen_sweep.bundle_keys:
+            print(f"  {key}")
+        selected = sorted(frozen_sweep.plan.open_ids)
+        print("selected open entries: " + (", ".join(selected) if selected else "none"))
+        return 0
     # Before the no-ledger early return below: a broken install is worth saying so
     # about whether or not there is anything to sweep.
     _warn_preflight_would_abort(paths, pol, require_sweep=True)
@@ -3317,6 +3390,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
         return 1
     paths = bmadconfig.load_paths(project)
     state = load_state(run_dir)
+    frozen_sweep = runsetup.preflight_filtered_resume(paths=paths, run_dir=run_dir, state=state)
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
@@ -3628,7 +3702,7 @@ def _prepare_resume_locked(project: Path, run_dir: Path, *, accept_baseline: boo
     # SweepEngine and _make_adapters are handed in from this module's namespace so
     # the test suite's `monkeypatch.setattr(cli, "SweepEngine"/"Engine"/..., ...)`
     # still applies.
-    return paths, state, pol, journal, new_digest, profiles, sweep_options
+    return paths, state, pol, journal, new_digest, profiles, sweep_options, frozen_sweep
 
 
 def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = False) -> int:
@@ -3655,7 +3729,7 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         prepared = _prepare_resume_locked(project, run_dir, accept_baseline=accept_baseline)
     if isinstance(prepared, int):
         return prepared
-    paths, state, pol, journal, new_digest, profiles, sweep_options = prepared
+    paths, state, pol, journal, new_digest, profiles, sweep_options, frozen_sweep = prepared
 
     # Adapter construction and the engine lifetime are deliberately outside the
     # state hold.  The pid/state publication above makes a rival control command
@@ -3674,6 +3748,7 @@ def _resume_paused_run(project: Path, run_dir: Path, *, accept_baseline: bool = 
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
         sweep_options=sweep_options,
+        frozen_sweep=frozen_sweep,
     )
     _warn_bypass_dropped(
         pol,
@@ -3945,6 +4020,10 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     state = load_state(run_dir)
+    if state.filtered_sweep:
+        runsetup.preflight_filtered_resume(
+            paths=bmadconfig.load_paths(project), run_dir=run_dir, state=state
+        )
     if state.paused_stage != PAUSE_ESCALATION:
         print(
             f"run {args.run_id} is not paused at an escalation "
@@ -6082,6 +6161,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     return install_into(project, clis=clis, skills=args.skills, force_skills=args.force_skills)
 
 
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    """Advertise machine-readable additive engine capabilities without project I/O."""
+    if args.json:
+        print(json.dumps(fanout.CAPABILITIES, separators=(",", ":")))
+    else:
+        print("filtered-sweep v1")
+    return 0
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     """``bmad-loop relay <Event>`` — the hook relay as an installed console script.
 
@@ -6302,6 +6390,12 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DATE",
         help="with --archive: archive only entries closed before this ISO date",
     )
+    sweep_p.add_argument("--fanout-schema", type=int, help="frozen fanout envelope version")
+    sweep_p.add_argument(
+        "--bundles", nargs="+", metavar="DW-KEY", help="exact cycle-1 bundle keys to execute"
+    )
+    sweep_p.add_argument("--triage-file", help="frozen deferred-sweep-triage JSON")
+    sweep_p.add_argument("--decisions-file", help="frozen sweep decisions JSON")
     sweep_p.add_argument("--run-id", help=argparse.SUPPRESS)  # pre-assigned id (used by the TUI)
 
     resume_p = add("resume", cmd_resume, "resume a paused run")
@@ -6536,6 +6630,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     relay_p.set_defaults(func=cmd_relay)
 
+    capabilities_p = sub.add_parser(
+        "capabilities", help="advertise additive machine-readable engine capabilities"
+    )
+    capabilities_p.add_argument("--json", action="store_true", help="emit capability JSON")
+    capabilities_p.set_defaults(func=cmd_capabilities)
+
     args = parser.parse_args(argv)
     # `relay` dispatches HERE, ahead of everything below, and the placement is the
     # contract rather than an optimization. A coding CLI runs `bmad-loop relay Stop`
@@ -6548,6 +6648,8 @@ def main(argv: list[str] | None = None) -> int:
     # session stopped. `cmd_relay` is total, so nothing is lost by not wrapping it.
     if args.func is cmd_relay:
         return cmd_relay(args)
+    if args.func is cmd_capabilities:
+        return cmd_capabilities(args)
     try:
         # Install the policy [mux] backend choice before dispatch: several
         # handlers (probe/diagnose/attach/stop/cleanup/tui) reach the mux

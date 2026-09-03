@@ -3108,6 +3108,36 @@ def test_selector_scope_change_gets_a_fresh_triage_retry_budget(project):
     assert engine.state.tasks[task.story_key].generation == 1
 
 
+def test_frozen_plan_runs_only_selected_bundle_without_triage_prompt_or_store(project):
+    write_ledger(project, {"DW-1": "open", "DW-2": "open"})
+    frozen_plan = TriagePlan(
+        open_ids=frozenset({"DW-1"}),
+        bundles=(Bundle("selected", ("DW-1",), "fix selected"),),
+    )
+    engine, adapter = make_sweep(
+        project,
+        [
+            bundle_dev_effect(
+                project, "selected", ["DW-1"], followup_review=False
+            )
+        ],
+        frozen_plan=frozen_plan,
+        frozen_answers={},
+        repeat=True,
+        max_bundles=0,
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused and not summary.crashed
+    assert [session.role for session in adapter.sessions] == ["dev"]
+    entries = ledger_entries(project)
+    assert entries["DW-1"].done
+    assert entries["DW-2"].open
+    assert not (project.project / ".bmad-loop" / "decisions.json").exists()
+    assert "triage-decision" not in journal_text(engine)
+
+
 def test_sweep_worktree_bundle_merges_to_target(project):
     """A sweep bundle runs in its own worktree and merges back: the ledger
     closes land on the target branch and the worktree is cleaned up."""

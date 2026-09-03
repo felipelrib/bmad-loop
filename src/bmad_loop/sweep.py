@@ -1419,6 +1419,8 @@ class SweepEngine(Engine):
         only_ids: tuple[str, ...] | None = None,
         min_severity: str | None = None,
         prompter: DecisionPrompter | None = None,
+        frozen_plan: TriagePlan | None = None,
+        frozen_answers: dict[str, dict[str, str]] | None = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -1524,6 +1526,15 @@ class SweepEngine(Engine):
         # can speak to). Sampled before any phase runs, so no arm of this run's own
         # can contaminate it.
         self._ledger_doubt_inherited = self.state.sweep_ledger_in_doubt
+        self.frozen_plan = frozen_plan
+        self.frozen_answers = frozen_answers
+        if frozen_plan is not None:
+            # Frozen fanout contract: the plan and answers are inputs, so the run
+            # never triages, prompts, repeats, or applies set-changing controls.
+            self.prompting = False
+            self.decisions_only = False
+            self.repeat = False
+            self.max_cycles = 1
         self.state.run_type = "sweep"
 
     def _ledger_unfit_to_publish(self) -> bool:
@@ -2099,7 +2110,7 @@ class SweepEngine(Engine):
                 and migrate_task is not None
                 and migrate_task.phase not in (Phase.DONE, Phase.ESCALATED)
             )
-            if deferredwork.has_legacy(text) or migration_resume:
+            if self.frozen_plan is None and (deferredwork.has_legacy(text) or migration_resume):
                 if cycle > 1:
                     # freeform text appeared mid-run; _ensure_migration assumes
                     # one migration per run, so hand off to a fresh sweep
@@ -2768,6 +2779,10 @@ class SweepEngine(Engine):
         `LedgerReadFault` (DW-279); pre-lock probes, lock and write failures
         remain raw `OSError`.
         """
+        if self.frozen_plan is not None:
+            # A frozen sweep never consulted the project decision store, so there
+            # is nothing of its own to prune and nothing it may write there.
+            return
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         ledger = self.workspace.paths.deferred_work
@@ -5009,6 +5024,8 @@ class SweepEngine(Engine):
     # --------------------------------------------------------------- triage
 
     def _ensure_triage(self, open_now: set[str], cycle: int = 1) -> TriagePlan:
+        if self.frozen_plan is not None:
+            return self.frozen_plan
         suffix = "" if cycle == 1 else f"-{cycle}"
         triage_path = self.run_dir / f"triage{suffix}.json"
         triage_key = TRIAGE_KEY + suffix
@@ -5764,6 +5781,11 @@ class SweepEngine(Engine):
     def _decisions_phase(
         self, plan: TriagePlan
     ) -> tuple[dict[str, dict[str, Any]], int, frozenset[str]]:
+        if self.frozen_answers is not None:
+            # Frozen fanout contract: the answers were pinned at launch and every
+            # executable field is derived from the triage option, so no store is
+            # read, no prompt is raised, and no effect can be unlanded.
+            return self.frozen_answers, 0, frozenset()
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
@@ -8040,7 +8062,7 @@ class SweepEngine(Engine):
                     continue
             kept.append(b)
         bundles = kept
-        if len(bundles) > self.max_bundles:
+        if self.frozen_plan is None and len(bundles) > self.max_bundles:
             dropped = [b.name for b in bundles[self.max_bundles :]]
             self.journal.append("sweep-bundles-truncated", dropped=dropped)
             bundles = bundles[: self.max_bundles]
