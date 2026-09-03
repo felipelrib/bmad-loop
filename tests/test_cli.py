@@ -6915,6 +6915,140 @@ def test_filtered_dry_run_previews_only_the_validated_selection(project, capsys)
     assert "triage:" not in out
 
 
+def _write_filtered_sweep_inputs(project):
+    """Write one valid frozen contract for the CLI composition-boundary tests."""
+    from bmad_loop import deferredwork, fanout
+
+    install_bmad_config(project)
+    ledger_text = "### DW-1: Alpha\nstatus: open\nreason: test\n"
+    project.deferred_work.parent.mkdir(parents=True, exist_ok=True)
+    project.deferred_work.write_text(ledger_text, encoding="utf-8")
+    entry = deferredwork.parse_ledger(ledger_text)[0]
+    triage = project.project / "triage.json"
+    triage.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "workflow": "deferred-sweep-triage",
+                "open_ids": ["DW-1"],
+                "entry_sha256": {"DW-1": fanout.entry_sha256(entry)},
+                "already_resolved": [],
+                "bundles": [
+                    {"name": "alpha", "dw_ids": ["DW-1"], "intent": "build alpha"}
+                ],
+                "blocked": [],
+                "skip": [],
+                "decisions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    decisions = project.project / "decisions.json"
+    decisions.write_text("{}", encoding="utf-8")
+    return triage, decisions
+
+
+def test_valid_filtered_cli_launch_reaches_composed_engine(project, monkeypatch):
+    """Keep the frozen selection intact across cmd_sweep -> compose_sweep."""
+    triage, decisions = _write_filtered_sweep_inputs(project)
+    captured = {}
+
+    class Recorder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "SweepEngine", Recorder)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: object() for r in cli.ROLES})
+    monkeypatch.setattr(cli.verify, "worktree_clean", lambda _path: True)
+    monkeypatch.setattr(cli, "_require_base_skills", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_reconcile_stale", lambda *a, **k: None)
+
+    assert (
+        cli.main(
+            [
+                "sweep",
+                "--project",
+                str(project.project),
+                "--run-id",
+                "20990101-000000-acde",
+                "--fanout-schema",
+                "1",
+                "--bundles",
+                "dw-alpha",
+                "--triage-file",
+                str(triage),
+                "--decisions-file",
+                str(decisions),
+            ]
+        )
+        == 0
+    )
+    assert [bundle.name for bundle in captured["frozen_plan"].bundles] == ["alpha"]
+    assert captured["frozen_answers"] == {}
+    assert captured["prompting"] is False
+    assert captured["max_cycles"] == 1
+
+
+def test_filtered_resume_reconstructs_contract_for_composed_engine(project, monkeypatch):
+    """Keep persisted frozen inputs intact across resume -> compose_resume."""
+    from bmad_loop import fanout, runs
+    from bmad_loop.journal import load_state, save_state
+
+    triage, decisions = _write_filtered_sweep_inputs(project)
+    frozen = fanout.load_frozen_sweep(
+        schema_version=1,
+        bundle_keys=("dw-alpha",),
+        triage_path=triage,
+        decisions_path=decisions,
+        ledger_path=project.deferred_work,
+    )
+    policy = policy_mod.load(None)
+    adapters = lambda *a, **k: {r: object() for r in cli.ROLES}
+    runsetup.compose_sweep(
+        project=project.project,
+        paths=project,
+        policy=policy,
+        run_id="20990101-000000-acde",
+        prompting=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=False,
+        max_cycles=1,
+        trigger="cli",
+        make_adapters=adapters,
+        sweep_engine_cls=lambda **kwargs: types.SimpleNamespace(run=lambda: None),
+        trusted_config_digest="a" * 64,
+        frozen_sweep=frozen,
+    )
+    run_dir = project.project / ".bmad-loop" / "runs" / "20990101-000000-acde"
+    state = load_state(run_dir)
+    state.paused_reason = "interrupted"
+    state.paused_stage = "sweep"
+    save_state(run_dir, state)
+    captured = {}
+
+    class Recorder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "SweepEngine", Recorder)
+    monkeypatch.setattr(cli, "_make_adapters", adapters)
+    monkeypatch.setattr(cli, "_require_base_skills", lambda *a, **k: True)
+    monkeypatch.setattr(runs, "kill_session", lambda _run_id: None)
+
+    assert cli._resume_paused_run(project.project, run_dir) == 0
+    assert [bundle.name for bundle in captured["frozen_plan"].bundles] == ["alpha"]
+    assert captured["frozen_answers"] == {}
+    assert captured["prompting"] is False
+    assert captured["max_cycles"] == 1
+
+
 # ------------------------------------------------------------------- cleanup
 
 
