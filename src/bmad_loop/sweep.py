@@ -385,6 +385,8 @@ class SweepEngine(Engine):
         repeat: bool | None = None,
         max_cycles: int | None = None,
         prompter: DecisionPrompter | None = None,
+        frozen_plan: TriagePlan | None = None,
+        frozen_answers: dict[str, dict[str, str]] | None = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -397,6 +399,13 @@ class SweepEngine(Engine):
         self.repeat = repeat if repeat is not None else self.policy.sweep.repeat
         self.max_cycles = max_cycles if max_cycles is not None else self.policy.sweep.max_cycles
         self.prompter = prompter or DecisionPrompter()
+        self.frozen_plan = frozen_plan
+        self.frozen_answers = frozen_answers
+        if frozen_plan is not None:
+            self.prompting = False
+            self.decisions_only = False
+            self.repeat = False
+            self.max_cycles = 1
         # decisions already journaled as skipped this process; without it a
         # persistent decision item would notify once per repeat cycle
         self._skipped_decisions: set[str] = set()
@@ -434,7 +443,7 @@ class SweepEngine(Engine):
             self.state.sweep_cycle = cycle
             self._save()
             text = ledger.read_text(encoding="utf-8") if ledger.is_file() else ""
-            if deferredwork.has_legacy(text):
+            if self.frozen_plan is None and deferredwork.has_legacy(text):
                 if cycle > 1:
                     # freeform text appeared mid-run; _ensure_migration assumes
                     # one migration per run, so hand off to a fresh sweep
@@ -570,6 +579,8 @@ class SweepEngine(Engine):
         """Drop consumed pre-answers — entries built or closed this cycle have
         left the open set. Keeps the store from re-applying a stale answer (and a
         keep-open answer's audit line) on the next sweep."""
+        if self.frozen_plan is not None:
+            return
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         ledger = self.workspace.paths.deferred_work
@@ -813,6 +824,8 @@ class SweepEngine(Engine):
     # --------------------------------------------------------------- triage
 
     def _ensure_triage(self, open_now: set[str], cycle: int = 1) -> TriagePlan:
+        if self.frozen_plan is not None:
+            return self.frozen_plan
         suffix = "" if cycle == 1 else f"-{cycle}"
         triage_path = self.run_dir / f"triage{suffix}.json"
         triage_key = TRIAGE_KEY + suffix
@@ -927,6 +940,8 @@ class SweepEngine(Engine):
         return len(closed)
 
     def _decisions_phase(self, plan: TriagePlan) -> tuple[dict[str, dict[str, str]], int]:
+        if self.frozen_answers is not None:
+            return self.frozen_answers, 0
         from . import decisions as decisions_store  # lazy: decisions imports sweep
 
         decisions_path = self.run_dir / "decisions.json"
@@ -1125,7 +1140,7 @@ class SweepEngine(Engine):
                 continue
             kept.append(b)
         bundles = kept
-        if len(bundles) > self.max_bundles:
+        if self.frozen_plan is None and len(bundles) > self.max_bundles:
             dropped = [b.name for b in bundles[self.max_bundles :]]
             self.journal.append("sweep-bundles-truncated", dropped=dropped)
             bundles = bundles[: self.max_bundles]

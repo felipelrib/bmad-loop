@@ -532,6 +532,10 @@ class RunState:
     crashed: bool = False
     crash_error: str | None = None
     run_type: str = "story"  # "story" | "sweep" — resume/status dispatch on it
+    # True only for the atomic frozen-input sweep capability. Persisted outside
+    # sweep.json so a missing/corrupt options file cannot downgrade resume to an
+    # ordinary tolerant sweep.
+    filtered_sweep: bool = False
     # story-queue source (policy.StoriesPolicy.source), pinned at run start so
     # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
     # without re-reading policy — a policy edit mid-run must not switch a live run's
@@ -610,6 +614,7 @@ class RunState:
             "crashed": self.crashed,
             "crash_error": self.crash_error,
             "run_type": self.run_type,
+            **({"filtered_sweep": True} if self.filtered_sweep else {}),
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
@@ -639,6 +644,7 @@ class RunState:
             crashed=bool(d.get("crashed", False)),
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
+            filtered_sweep=bool(d.get("filtered_sweep", False)),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),

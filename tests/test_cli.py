@@ -1511,10 +1511,12 @@ def test_attach_records_return_pane_inside_tmux(project, monkeypatch):
     monkeypatch.setattr(
         launch,
         "attach_plan",
-        lambda proj, rid: planned.append((proj, rid))
-        or (
-            ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
-            "=bmad-loop-ctl:sweep-RID",
+        lambda proj, rid: (
+            planned.append((proj, rid))
+            or (
+                ["tmux", "switch-client", "-t", "=bmad-loop-ctl"],
+                "=bmad-loop-ctl:sweep-RID",
+            )
         ),
     )
     monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1,0")
@@ -2822,6 +2824,15 @@ def test_sweep_command_parses_flags():
         "--max-cycles",
         "4",
         "--dry-run",
+        "--fanout-schema",
+        "1",
+        "--bundles",
+        "dw-alpha",
+        "dw-beta",
+        "--triage-file",
+        "triage.json",
+        "--decisions-file",
+        "decisions.json",
     ]
     # exercise argparse wiring only: dry-run path needs a valid project, so
     # just confirm parsing reaches cmd_sweep with the expected namespace
@@ -2846,6 +2857,94 @@ def test_sweep_command_parses_flags():
     assert captured["repeat"] is True
     assert captured["max_cycles"] == 4
     assert captured["dry_run"] is True
+    assert captured["fanout_schema"] == 1
+    assert captured["bundles"] == ["dw-alpha", "dw-beta"]
+    assert captured["triage_file"] == "triage.json"
+    assert captured["decisions_file"] == "decisions.json"
+
+
+def test_capabilities_json_is_project_independent_and_atomic(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "_configure_mux", lambda _project: pytest.fail("capabilities read project config")
+    )
+    assert cli.main(["capabilities", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "schema_version": 1,
+        "capabilities": {
+            "filtered_sweep": {
+                "version": 1,
+                "triage_workflow": "deferred-sweep-triage",
+                "decisions_format": "sweep-decisions-v1",
+            }
+        },
+    }
+
+
+def test_partial_fanout_group_refuses_before_repository_or_run_mutation(project, monkeypatch):
+    import argparse as ap
+
+    default_policy = policy_mod.load(None)
+    monkeypatch.setattr(cli, "_project", lambda _args: project.project)
+    monkeypatch.setattr(cli.bmadconfig, "load_paths", lambda _project: project)
+    monkeypatch.setattr(cli.policy_mod, "load", lambda _path: default_policy)
+    monkeypatch.setattr(
+        cli.verify,
+        "worktree_clean",
+        lambda _path: pytest.fail("preflight reached repository validation"),
+    )
+    monkeypatch.setattr(
+        cli, "_reconcile_stale", lambda *_args: pytest.fail("preflight reconciled stale runs")
+    )
+    monkeypatch.setattr(
+        cli, "_start_sweep", lambda *_args, **_kwargs: pytest.fail("preflight created a run")
+    )
+    args = ap.Namespace(
+        run_id=None,
+        dry_run=False,
+        no_prompt=False,
+        decisions_only=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+        fanout_schema=1,
+        bundles=["dw-alpha"],
+        triage_file=None,
+        decisions_file="decisions.json",
+    )
+    with pytest.raises(cli.fanout.FanoutError, match="missing --triage-file"):
+        cli.cmd_sweep(args)
+
+
+def test_fanout_rejects_set_changing_controls_before_loading_inputs(project, monkeypatch):
+    args = argparse.Namespace(
+        fanout_schema=1,
+        bundles=["dw-alpha"],
+        triage_file="triage.json",
+        decisions_file="decisions.json",
+        decisions_only=False,
+        max_bundles=None,
+        repeat=True,
+        max_cycles=None,
+    )
+    monkeypatch.setattr(
+        cli.fanout,
+        "load_frozen_sweep",
+        lambda **_kwargs: pytest.fail("conflicting fanout loaded frozen inputs"),
+    )
+    with pytest.raises(cli.fanout.FanoutError, match="--repeat/--no-repeat"):
+        cli._fanout_preflight(args, project)
+
+
+def test_filtered_dry_run_previews_only_the_validated_selection(project, capsys):
+    frozen = types.SimpleNamespace(
+        bundle_keys=("dw-gamma", "dw-alpha"),
+        plan=types.SimpleNamespace(open_ids=frozenset({"DW-3", "DW-1"})),
+    )
+    assert cli._sweep_dry_run(project, policy_mod.load(None), frozen_sweep=frozen) == 0
+    out = capsys.readouterr().out
+    assert "dw-gamma" in out and "dw-alpha" in out
+    assert "selected open entries: DW-1, DW-3" in out
+    assert "triage:" not in out
 
 
 # ------------------------------------------------------------------- cleanup
@@ -7846,9 +7945,9 @@ def test_auto_sweep_launches_the_profile_bytes_the_gate_validated(project, monke
     factory = cli._sweep_factory(project.project, bmadconfig.load_paths(project.project), pin)
     factory("epic-boundary")  # the gate saw the honest bytes and passed
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -7924,9 +8023,9 @@ def test_run_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli.main(["run", "--project", str(project.project)]) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     run_id = captured["state"].run_id
     assert runs.read_trusted_config_digest(project.project, run_id) == pin
@@ -7984,9 +8083,9 @@ def test_resume_pins_the_profile_bytes_it_launches(project, monkeypatch):
 
     assert cli._resume_paused_run(project.project, run_dir) == 0
 
-    assert (
-        profile_mod.get_profile("mycli", project.project).binary == "rogue-cli"
-    ), "the swap must actually have landed on disk, or this test proves nothing"
+    assert profile_mod.get_profile("mycli", project.project).binary == "rogue-cli", (
+        "the swap must actually have landed on disk, or this test proves nothing"
+    )
     assert captured["adapter"].profile.binary == "mycli"
     assert runs.read_trusted_config_digest(project.project, run_dir.name) == pin
 
