@@ -536,6 +536,10 @@ class RunState:
     # sweep.json so a missing/corrupt options file cannot downgrade resume to an
     # ordinary tolerant sweep.
     filtered_sweep: bool = False
+    # True only when a decisions-only sweep was seeded from a frozen triage
+    # document. Kept outside sweep.json so resume cannot silently downgrade a
+    # missing/torn contract into a provider-driven triage session.
+    triage_input: bool = False
     # story-queue source (policy.StoriesPolicy.source), pinned at run start so
     # resume/resolve rebuild the right engine (StoriesEngine vs the sprint Engine)
     # without re-reading policy — a policy edit mid-run must not switch a live run's
@@ -615,6 +619,7 @@ class RunState:
             "crash_error": self.crash_error,
             "run_type": self.run_type,
             **({"filtered_sweep": True} if self.filtered_sweep else {}),
+            **({"triage_input": True} if self.triage_input else {}),
             "source": self.source,
             "spec_folder": self.spec_folder,
             "sweep_cycle": self.sweep_cycle,
@@ -645,6 +650,7 @@ class RunState:
             crash_error=d.get("crash_error"),
             run_type=str(d.get("run_type", "story")),
             filtered_sweep=bool(d.get("filtered_sweep", False)),
+            triage_input=bool(d.get("triage_input", False)),
             source=str(d.get("source", "sprint-status")),
             spec_folder=str(d.get("spec_folder", "")),
             sweep_cycle=int(d.get("sweep_cycle", 1)),

@@ -1921,6 +1921,7 @@ def _start_sweep(
     run_id: str | None = None,
     profiles=None,
     frozen_sweep: fanout.FrozenSweep | None = None,
+    frozen_triage: fanout.FrozenTriage | None = None,
 ) -> int:
     # The composition (run dir + state + pid + sweep.json + adapters + engine)
     # lives in runsetup; this stays compose -> render. SweepEngine and
@@ -1947,6 +1948,7 @@ def _start_sweep(
         trusted_config_digest=_trusted_config_digest(pol, project, profiles=profiles),
         profiles=profiles,
         frozen_sweep=frozen_sweep,
+        frozen_triage=frozen_triage,
     )
     print(f"sweep {composed.run_id} starting (attach: bmad-loop attach)")
     summary = composed.engine.run()
@@ -2028,10 +2030,11 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     project = _project(args)
     paths = bmadconfig.load_paths(project)
     pol = policy_mod.load(_policy_path(project))
-    frozen_sweep = _fanout_preflight(args, paths)
+    frozen_triage = _triage_input_preflight(args, paths)
+    frozen_sweep = None if frozen_triage is not None else _fanout_preflight(args, paths)
 
     if args.dry_run:
-        return _sweep_dry_run(paths, pol, frozen_sweep=frozen_sweep)
+        return _sweep_dry_run(paths, pol, frozen_sweep=frozen_sweep, frozen_triage=frozen_triage)
 
     if (rc := _reject_isolation_conflict(paths, pol)) is not None:
         return rc
@@ -2051,12 +2054,41 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         pol,
         prompting=False if frozen_sweep is not None else not args.no_prompt,
         decisions_only=False if frozen_sweep is not None else args.decisions_only,
-        max_bundles=None if frozen_sweep is not None else args.max_bundles,
-        repeat=False if frozen_sweep is not None else args.repeat,
-        max_cycles=1 if frozen_sweep is not None else args.max_cycles,
+        max_bundles=None
+        if frozen_sweep is not None or frozen_triage is not None
+        else args.max_bundles,
+        repeat=False if frozen_sweep is not None or frozen_triage is not None else args.repeat,
+        max_cycles=1 if frozen_sweep is not None or frozen_triage is not None else args.max_cycles,
         trigger="cli",
         run_id=args.run_id,
         frozen_sweep=frozen_sweep,
+        frozen_triage=frozen_triage,
+    )
+
+
+def _triage_input_preflight(
+    args: argparse.Namespace, paths: bmadconfig.ProjectPaths
+) -> fanout.FrozenTriage | None:
+    """Accept triage alone only as an explicit interactive decisions sitting."""
+    if args.triage_file is None:
+        return None
+    if any(value is not None for value in (args.fanout_schema, args.bundles, args.decisions_file)):
+        return None
+    if not args.decisions_only:
+        raise fanout.FanoutError("triage-only input requires --decisions-only")
+    conflicts = []
+    if args.no_prompt:
+        conflicts.append("--no-prompt")
+    if args.max_bundles is not None:
+        conflicts.append("--max-bundles")
+    if args.repeat is not None:
+        conflicts.append("--repeat/--no-repeat")
+    if args.max_cycles is not None:
+        conflicts.append("--max-cycles")
+    if conflicts:
+        raise fanout.FanoutError("triage-only input conflicts with: " + ", ".join(conflicts))
+    return fanout.load_frozen_triage(
+        triage_path=Path(args.triage_file), ledger_path=paths.deferred_work
     )
 
 
@@ -2102,6 +2134,7 @@ def _sweep_dry_run(
     pol,
     *,
     frozen_sweep: fanout.FrozenSweep | None = None,
+    frozen_triage: fanout.FrozenTriage | None = None,
 ) -> int:
     if frozen_sweep is not None:
         print("filtered sweep: validated frozen schema 1 contract")
@@ -2109,6 +2142,10 @@ def _sweep_dry_run(
             print(f"  {key}")
         selected = sorted(frozen_sweep.plan.open_ids)
         print("selected open entries: " + (", ".join(selected) if selected else "none"))
+        return 0
+    if frozen_triage is not None:
+        print("decisions-only sweep: validated frozen triage input")
+        print(f"pending decisions: {len(frozen_triage.plan.decisions)}")
         return 0
     # Before the no-ledger early return below: a broken install is worth saying so
     # about whether or not there is anything to sweep.
@@ -2145,6 +2182,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
     paths = bmadconfig.load_paths(project)
     state = load_state(run_dir)
     frozen_sweep = runsetup.preflight_filtered_resume(paths=paths, run_dir=run_dir, state=state)
+    frozen_triage = runsetup.preflight_triage_input_resume(run_dir=run_dir, state=state)
     if state.finished:
         print(f"run {run_dir.name} already finished", file=sys.stderr)
         return 1
@@ -2305,6 +2343,7 @@ def _resume_paused_run(project: Path, run_dir: Path) -> int:
         sweep_engine_cls=SweepEngine,
         profiles=profiles,
         frozen_sweep=frozen_sweep,
+        frozen_triage=frozen_triage,
     )
     summary = composed.engine.run()
     print(summary.render())

@@ -2965,9 +2965,7 @@ def _write_filtered_sweep_inputs(project):
                 "open_ids": ["DW-1"],
                 "entry_sha256": {"DW-1": fanout.entry_sha256(entry)},
                 "already_resolved": [],
-                "bundles": [
-                    {"name": "alpha", "dw_ids": ["DW-1"], "intent": "build alpha"}
-                ],
+                "bundles": [{"name": "alpha", "dw_ids": ["DW-1"], "intent": "build alpha"}],
                 "blocked": [],
                 "skip": [],
                 "decisions": [],
@@ -2978,6 +2976,97 @@ def _write_filtered_sweep_inputs(project):
     decisions = project.project / "decisions.json"
     decisions.write_text("{}", encoding="utf-8")
     return triage, decisions
+
+
+def _write_triage_only_input(project):
+    install_bmad_config(project)
+    write_ledger(project, {"DW-1": "open"})
+    triage = project.project / "triage-only.json"
+    triage.write_text(
+        json.dumps(
+            {
+                "workflow": "deferred-sweep-triage",
+                "open_ids": ["DW-1"],
+                "already_resolved": [],
+                "bundles": [],
+                "blocked": [],
+                "skip": [],
+                "decisions": [
+                    {
+                        "id": "DW-1",
+                        "question": "Close it?",
+                        "context": "bounded fixture",
+                        "options": [
+                            {"key": "1", "label": "Close", "effect": "close"},
+                            {"key": "2", "label": "Keep", "effect": "keep-open"},
+                        ],
+                        "recommendation": "1",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return triage
+
+
+def test_triage_only_input_requires_decisions_only(project):
+    triage = _write_triage_only_input(project)
+    args = argparse.Namespace(
+        fanout_schema=None,
+        bundles=None,
+        triage_file=str(triage),
+        decisions_file=None,
+        decisions_only=False,
+        no_prompt=False,
+        max_bundles=None,
+        repeat=None,
+        max_cycles=None,
+    )
+
+    with pytest.raises(cli.fanout.FanoutError, match="requires --decisions-only"):
+        cli._triage_input_preflight(args, project)
+
+
+def test_triage_only_cli_launch_reaches_composed_engine(project, monkeypatch):
+    triage = _write_triage_only_input(project)
+    captured = {}
+
+    class Recorder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return types.SimpleNamespace(render=lambda: "")
+
+    monkeypatch.setattr(cli, "SweepEngine", Recorder)
+    monkeypatch.setattr(cli, "_make_adapters", lambda *a, **k: {r: object() for r in cli.ROLES})
+    monkeypatch.setattr(cli.verify, "worktree_clean", lambda _path: True)
+    monkeypatch.setattr(cli, "_require_base_skills", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_reconcile_stale", lambda *a, **k: None)
+
+    assert (
+        cli.main(
+            [
+                "sweep",
+                "--project",
+                str(project.project),
+                "--run-id",
+                "20990101-000000-acde",
+                "--decisions-only",
+                "--triage-file",
+                str(triage),
+            ]
+        )
+        == 0
+    )
+    document, plan = captured["triage_input"]
+    assert document["open_ids"] == ["DW-1"]
+    assert [decision.id for decision in plan.decisions] == ["DW-1"]
+    assert captured["prompting"] is True
+    assert captured["decisions_only"] is True
+    assert captured["frozen_plan"] is None
+    assert captured["max_cycles"] == 1
 
 
 def test_valid_filtered_cli_launch_reaches_composed_engine(project, monkeypatch):

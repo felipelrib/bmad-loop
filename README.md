@@ -309,6 +309,20 @@ Four shapes declare a gate nothing can enforce, and each is a warning while the 
 
 Sweeps are their own resumable runs (`bmad-loop resume <id>`). `[sweep] auto` in the policy fires an unattended sweep automatically at epic boundaries or run end; a failed/paused child sweep never interrupts the parent run.
 
+For deterministic verification of an interactive decisions sitting, a validated
+triage document can replace only the coding-model triage session:
+
+```bash
+bmad-loop sweep --decisions-only --triage-file /frozen/triage.json
+```
+
+The engine validates the duplicate-free upstream document against the current
+open ledger before run creation, persists its document and digest for resume,
+then follows the ordinary native decision-prompt, journal, ledger, and terminal
+evidence paths. This pairing rejects `--no-prompt`, bundle-selection flags, and
+cycle/set-changing controls. Without it, ordinary sweeps retain provider-driven
+triage behavior.
+
 ### Frozen named-bundle sweeps
 
 Fanout workers can execute an exact, pre-triaged subset with the atomic v1 flag group:

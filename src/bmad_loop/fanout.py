@@ -189,6 +189,24 @@ class FrozenSweep:
         return body
 
 
+@dataclass(frozen=True)
+class FrozenTriage:
+    """One validated triage document for a provider-free decisions sitting."""
+
+    triage_document: dict[str, Any]
+    triage_sha256: str
+    plan: TriagePlan
+
+    def persisted(self) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+            "triage": self.triage_document,
+            "triage_sha256": self.triage_sha256,
+        }
+        body["contract_sha256"] = hashlib.sha256(_canonical(body)).hexdigest()
+        return body
+
+
 def _build(
     *,
     schema_version: int,
@@ -315,6 +333,46 @@ def load_frozen_sweep(
         decisions_sha256=decisions_sha256,
         ledger_path=ledger_path,
     )
+
+
+def load_frozen_triage(*, triage_path: Path, ledger_path: Path) -> FrozenTriage:
+    """Validate a triage-only fixture against the current open ledger."""
+    triage_value, triage_sha256 = strict_json_file(triage_path, "triage")
+    triage = _require_object(triage_value, "triage")
+    try:
+        ledger_text = ledger_path.read_text(encoding="utf-8") if ledger_path.is_file() else ""
+    except (OSError, UnicodeError) as exc:
+        raise FanoutError(f"cannot read deferred-work ledger: {ledger_path}") from exc
+    plan, errors = validate_triage(triage, deferredwork.open_ids(ledger_text))
+    if plan is None:
+        raise FanoutError("triage is invalid: " + "; ".join(errors))
+    return FrozenTriage(triage, triage_sha256, plan)
+
+
+def build_frozen_triage(value: Any) -> FrozenTriage:
+    """Rebuild a persisted triage-only contract without mutable-ledger rereads."""
+    persisted = _require_object(value, "persisted triage input")
+    required = {"schema_version", "triage", "triage_sha256", "contract_sha256"}
+    if set(persisted) != required:
+        raise FanoutError("persisted triage input is missing or has unknown fields")
+    if (
+        type(persisted["schema_version"]) is not int
+        or persisted["schema_version"] != SCHEMA_VERSION
+    ):
+        raise FanoutError("persisted triage input schema is incompatible; expected 1")
+    digest = persisted["triage_sha256"]
+    if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+        raise FanoutError("persisted triage input digest is not lowercase SHA-256")
+    claimed = persisted["contract_sha256"]
+    body = {key: item for key, item in persisted.items() if key != "contract_sha256"}
+    actual = hashlib.sha256(_canonical(body)).hexdigest()
+    if not isinstance(claimed, str) or claimed != actual:
+        raise FanoutError("persisted triage input was tampered with")
+    triage = _require_object(persisted["triage"], "triage")
+    plan, errors = validate_triage(triage, None)
+    if plan is None:
+        raise FanoutError("triage is invalid: " + "; ".join(errors))
+    return FrozenTriage(triage, digest, plan)
 
 
 def build_frozen_sweep(value: Any, ledger_path: Path) -> FrozenSweep:

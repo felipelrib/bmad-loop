@@ -888,6 +888,7 @@ def compose_sweep(
     trusted_config_digest: str,
     profiles: dict[str, CLIProfile] | None = None,
     frozen_sweep: fanout.FrozenSweep | None = None,
+    frozen_triage: fanout.FrozenTriage | None = None,
 ) -> ComposedRun:
     """Stand up a sweep run: allocate the run dir, persist state + pid, record the
     sweep options, build the adapters, and wire the ``SweepEngine`` — everything
@@ -915,6 +916,7 @@ def compose_sweep(
         policy_snapshot=policy.to_dict(),
         run_type="sweep",
         filtered_sweep=frozen_sweep is not None,
+        triage_input=frozen_triage is not None,
         trusted_config_digest=trusted_config_digest,
     )
     save_state(run_dir, state)
@@ -931,6 +933,8 @@ def compose_sweep(
     }
     if frozen_sweep is not None:
         options["fanout"] = frozen_sweep.persisted()
+    if frozen_triage is not None:
+        options["triage_input"] = frozen_triage.persisted()
     # Persist the sweep options atomically (tmp + os.replace), the way save_state
     # writes state.json: a resume reads this back to rebuild the SweepEngine, so a
     # crash mid-write must not leave a torn file the recovery path then chokes on.
@@ -956,6 +960,9 @@ def compose_sweep(
         max_cycles=max_cycles,
         frozen_plan=frozen_sweep.plan if frozen_sweep is not None else None,
         frozen_answers=frozen_sweep.answers if frozen_sweep is not None else None,
+        triage_input=(frozen_triage.triage_document, frozen_triage.plan)
+        if frozen_triage is not None
+        else None,
     )
     return ComposedRun(engine=engine, run_id=run_id, run_dir=run_dir, state=state, journal=journal)
 
@@ -970,6 +977,16 @@ def preflight_filtered_resume(
     if not isinstance(value, dict) or "fanout" not in value:
         raise fanout.FanoutError("filtered sweep state is missing its fanout contract")
     return fanout.build_frozen_sweep(value["fanout"], paths.deferred_work)
+
+
+def preflight_triage_input_resume(*, run_dir: Path, state: RunState) -> fanout.FrozenTriage | None:
+    """Reconstruct a triage-only contract before resume performs mutation."""
+    if not state.triage_input:
+        return None
+    value, _digest = fanout.strict_json_file(run_dir / "sweep.json", "triage input state")
+    if not isinstance(value, dict) or "triage_input" not in value:
+        raise fanout.FanoutError("triage input state is missing its frozen contract")
+    return fanout.build_frozen_triage(value["triage_input"])
 
 
 def compose_resume(
@@ -987,6 +1004,7 @@ def compose_resume(
     sweep_engine_cls: type[SweepEngine],
     profiles: dict[str, CLIProfile] | None = None,
     frozen_sweep: fanout.FrozenSweep | None = None,
+    frozen_triage: fanout.FrozenTriage | None = None,
 ) -> ComposedRun:
     """Rebuild the engine for a paused/interrupted run and return it ready to
     :meth:`run` — the adapter build + engine selection ``cli._resume_paused_run``
@@ -1036,6 +1054,9 @@ def compose_resume(
             max_cycles=opts.get("max_cycles"),
             frozen_plan=frozen_sweep.plan if frozen_sweep is not None else None,
             frozen_answers=frozen_sweep.answers if frozen_sweep is not None else None,
+            triage_input=(frozen_triage.triage_document, frozen_triage.plan)
+            if frozen_triage is not None
+            else None,
         )
     else:
         story_common = dict(

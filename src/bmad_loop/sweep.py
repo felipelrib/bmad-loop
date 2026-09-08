@@ -387,6 +387,7 @@ class SweepEngine(Engine):
         prompter: DecisionPrompter | None = None,
         frozen_plan: TriagePlan | None = None,
         frozen_answers: dict[str, dict[str, str]] | None = None,
+        triage_input: tuple[dict[str, Any], TriagePlan] | None = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -401,9 +402,17 @@ class SweepEngine(Engine):
         self.prompter = prompter or DecisionPrompter()
         self.frozen_plan = frozen_plan
         self.frozen_answers = frozen_answers
+        self.triage_input = triage_input
+        if frozen_plan is not None and triage_input is not None:
+            raise ValueError("filtered sweep and triage-only input are mutually exclusive")
         if frozen_plan is not None:
             self.prompting = False
             self.decisions_only = False
+            self.repeat = False
+            self.max_cycles = 1
+        if triage_input is not None:
+            if not decisions_only:
+                raise ValueError("frozen triage input requires decisions-only mode")
             self.repeat = False
             self.max_cycles = 1
         # decisions already journaled as skipped this process; without it a
@@ -553,7 +562,11 @@ class SweepEngine(Engine):
         answers, decisions_closed = self._decisions_phase(plan)
         bundles = self._materialize_bundles(plan, answers)
         if self.decisions_only:
-            self.journal.append("sweep-decisions-only", bundles_not_run=len(bundles))
+            self.journal.append(
+                "sweep-decisions-only",
+                bundles_not_run=len(bundles),
+                pending_required=len(plan.decisions),
+            )
             self._prune_pre_answers()
             self._emit("post_sweep_cycle", phase=str(cycle))
             return False
@@ -837,6 +850,8 @@ class SweepEngine(Engine):
             try:
                 cached = _read_json(triage_path)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                if self.triage_input is not None:
+                    raise RuntimeError("persisted triage input evidence is unreadable") from exc
                 self.journal.append("sweep-triage-reload-failed", errors=[f"unreadable: {exc}"])
             else:
                 if isinstance(cached, dict):
@@ -844,8 +859,28 @@ class SweepEngine(Engine):
                 else:
                     plan, errors = None, [f"not a JSON object: {type(cached).__name__}"]
                 if plan is not None:
+                    if self.triage_input is not None and cached != self.triage_input[0]:
+                        raise RuntimeError("persisted triage input evidence was substituted")
                     return plan
+                if self.triage_input is not None:
+                    raise RuntimeError("persisted triage input evidence is invalid")
                 self.journal.append("sweep-triage-reload-failed", errors=errors)
+
+        if self.triage_input is not None:
+            document, plan = self.triage_input
+            triage_tmp = triage_path.with_suffix(".json.tmp")
+            triage_tmp.write_text(json.dumps(document, indent=2), encoding="utf-8")
+            atomic_replace(triage_tmp, triage_path)
+            self.journal.append(
+                "sweep-triage-result",
+                bundles=len(plan.bundles),
+                decisions=len(plan.decisions),
+                already_resolved=len(plan.already_resolved),
+                blocked=len(plan.blocked),
+                skip=len(plan.skip),
+                source="frozen-triage-input",
+            )
+            return plan
 
         task = self.state.tasks.get(triage_key)
         if task is None:
