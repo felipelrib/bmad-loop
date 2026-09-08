@@ -130,6 +130,26 @@ def test_triage_only_input_rejects_duplicate_json_keys(tmp_path: Path):
         load_frozen_triage(triage_path=triage, ledger_path=ledger)
 
 
+def test_triage_only_input_allows_distinct_zero_pass_after_final_close(tmp_path: Path):
+    ledger = tmp_path / "deferred-work.md"
+    ledger.write_text("# Deferred work\n", encoding="utf-8")
+    triage = tmp_path / "triage.json"
+    document = {
+        "workflow": "deferred-sweep-triage",
+        "open_ids": ["DW-1"],
+        "already_resolved": [],
+        "bundles": [],
+        "blocked": [],
+        "skip": [{"id": "DW-1", "reason": "prior pass input"}],
+        "decisions": [],
+    }
+    triage.write_text(json.dumps(document), encoding="utf-8")
+
+    frozen = load_frozen_triage(triage_path=triage, ledger_path=ledger)
+
+    assert frozen.plan.open_ids == frozenset({"DW-1"})
+
+
 def test_selects_exact_noncontiguous_and_decision_bundles_from_frozen_semantics(
     frozen_inputs,
 ):
