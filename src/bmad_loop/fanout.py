@@ -343,7 +343,12 @@ def load_frozen_triage(*, triage_path: Path, ledger_path: Path) -> FrozenTriage:
         ledger_text = ledger_path.read_text(encoding="utf-8") if ledger_path.is_file() else ""
     except (OSError, UnicodeError) as exc:
         raise FanoutError(f"cannot read deferred-work ledger: {ledger_path}") from exc
-    plan, errors = validate_triage(triage, deferredwork.open_ids(ledger_text))
+    open_ids = deferredwork.open_ids(ledger_text)
+    # The same immutable fixture is supplied to the distinct verification pass.
+    # Once the answered decision closed the final ledger entry, the sweep exits
+    # before consulting triage; still validate the document's own structure, but
+    # do not reject the now-stale open set for an input that cannot be consumed.
+    plan, errors = validate_triage(triage, open_ids if open_ids else None)
     if plan is None:
         raise FanoutError("triage is invalid: " + "; ".join(errors))
     return FrozenTriage(triage, triage_sha256, plan)
