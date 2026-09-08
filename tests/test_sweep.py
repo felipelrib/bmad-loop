@@ -6210,6 +6210,66 @@ def test_decisions_only_runs_no_bundles(project):
     assert entries["DW-2"].open  # bundle not run
 
 
+def test_frozen_triage_drives_native_prompt_without_triage_session(project):
+    write_ledger(project, {"DW-1": "open"})
+    document = triage_result(
+        ["DW-1"],
+        decisions=[
+            {
+                "id": "DW-1",
+                "question": "Close it?",
+                "context": "bounded fixture",
+                "options": [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    )
+    plan, errors = validate_triage(document, {"DW-1"})
+    assert plan is not None and errors == []
+    engine, adapter = make_sweep(
+        project,
+        [],
+        answers=["1"],
+        prompting=True,
+        decisions_only=True,
+        triage_input=(document, plan),
+    )
+
+    summary = engine.run()
+
+    assert not summary.paused
+    assert adapter.sessions == []
+    assert json.loads((engine.run_dir / "triage.json").read_text()) == document
+    assert json.loads((engine.run_dir / "decisions.json").read_text())["DW-1"]["key"] == "1"
+    records = [json.loads(line) for line in journal_text(engine).splitlines()]
+    triage_records = [r for r in records if r["kind"] == "sweep-triage-result"]
+    assert len(triage_records) == 1
+    assert {
+        key: triage_records[0][key]
+        for key in (
+            "bundles",
+            "decisions",
+            "already_resolved",
+            "blocked",
+            "skip",
+            "source",
+        )
+    } == {
+        "bundles": 0,
+        "decisions": 1,
+        "already_resolved": 0,
+        "blocked": 0,
+        "skip": 0,
+        "source": "frozen-triage-input",
+    }
+    terminal = next(r for r in records if r["kind"] == "sweep-decisions-only")
+    assert terminal["pending_required"] == 1
+    assert ledger_entries(project)["DW-1"].status.startswith("done")
+
+
 def _decision(dw_id, options, recommendation="1", question="q"):
     return {
         "id": dw_id,

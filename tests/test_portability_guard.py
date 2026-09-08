@@ -300,6 +300,8 @@ REFUSAL_HELPER_DEFS = {
     ("cli.py", "_reject_isolation_conflict"),
     ("cli.py", "_reject_under_floor_git"),
     ("engine.py", "_refuse_gated_story"),
+    # frozen fanout contract: duplicate JSON keys in a frozen document; test_fanout.py
+    ("fanout.py", "_reject_duplicates"),
     ("platform_util.py", "_refuse_unwritable_target"),
     ("platform_util.py", "_refuse_unwritable_target_at"),
     ("resolve.py", "_reject_json_constant"),
@@ -436,6 +438,10 @@ JOURNAL_KIND_BENIGN_FIELDS = {
     # here it is the run mode and the literal manifest name `stories.yaml`.
     "run-start": frozenset({"source"}),
     "deferred-close-declaration-unreadable": frozenset({"source"}),
+    # Frozen triage sittings (fork): `source` is the fixed token
+    # `frozen-triage-input` and `pending_required` the plan's decision count.
+    "sweep-triage-result": frozenset({"source"}),
+    "sweep-decisions-only": frozenset({"pending_required"}),
     # DW-439: a closed slug (`restored` | `no-dir-fd` | `no-snapshot`), never
     # authored text; declared on this kind alone because `outcome` is generic.
     "sweep-migration-snapshot-restore": frozenset({"outcome"}),

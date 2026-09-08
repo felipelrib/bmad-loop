@@ -12,9 +12,11 @@ from bmad_loop.model import RunState
 from bmad_loop.fanout import (
     CAPABILITIES,
     FanoutError,
+    build_frozen_triage,
     build_frozen_sweep,
     entry_sha256,
     load_frozen_sweep,
+    load_frozen_triage,
     strict_json_file,
 )
 
@@ -81,6 +83,51 @@ def test_capability_document_is_the_atomic_v1_handshake():
             }
         },
     }
+
+
+def test_triage_only_input_validates_and_round_trips_without_bundle_flags(tmp_path: Path):
+    ledger_text = _entry("DW-1")
+    ledger = tmp_path / "deferred-work.md"
+    ledger.write_text(ledger_text, encoding="utf-8")
+    triage = tmp_path / "triage.json"
+    document = {
+        "workflow": "deferred-sweep-triage",
+        "open_ids": ["DW-1"],
+        "already_resolved": [],
+        "bundles": [],
+        "blocked": [],
+        "skip": [],
+        "decisions": [
+            {
+                "id": "DW-1",
+                "question": "Close it?",
+                "context": "bounded fixture",
+                "options": [
+                    {"key": "1", "label": "Close", "effect": "close"},
+                    {"key": "2", "label": "Keep", "effect": "keep-open"},
+                ],
+                "recommendation": "1",
+            }
+        ],
+    }
+    triage.write_text(json.dumps(document), encoding="utf-8")
+
+    frozen = load_frozen_triage(triage_path=triage, ledger_path=ledger)
+    rebuilt = build_frozen_triage(frozen.persisted())
+
+    assert rebuilt.triage_document == document
+    assert [decision.id for decision in rebuilt.plan.decisions] == ["DW-1"]
+    assert rebuilt.triage_sha256 == frozen.triage_sha256
+
+
+def test_triage_only_input_rejects_duplicate_json_keys(tmp_path: Path):
+    ledger = tmp_path / "deferred-work.md"
+    ledger.write_text(_entry("DW-1"), encoding="utf-8")
+    triage = tmp_path / "triage.json"
+    triage.write_text('{"workflow":"deferred-sweep-triage","workflow":"other"}')
+
+    with pytest.raises(FanoutError, match="duplicate JSON key"):
+        load_frozen_triage(triage_path=triage, ledger_path=ledger)
 
 
 def test_selects_exact_noncontiguous_and_decision_bundles_from_frozen_semantics(

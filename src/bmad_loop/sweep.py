@@ -1421,6 +1421,7 @@ class SweepEngine(Engine):
         prompter: DecisionPrompter | None = None,
         frozen_plan: TriagePlan | None = None,
         frozen_answers: dict[str, dict[str, str]] | None = None,
+        triage_input: tuple[dict[str, Any], TriagePlan] | None = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -1528,11 +1529,21 @@ class SweepEngine(Engine):
         self._ledger_doubt_inherited = self.state.sweep_ledger_in_doubt
         self.frozen_plan = frozen_plan
         self.frozen_answers = frozen_answers
+        self.triage_input = triage_input
+        if frozen_plan is not None and triage_input is not None:
+            raise ValueError("filtered sweep and triage-only input are mutually exclusive")
         if frozen_plan is not None:
             # Frozen fanout contract: the plan and answers are inputs, so the run
             # never triages, prompts, repeats, or applies set-changing controls.
             self.prompting = False
             self.decisions_only = False
+            self.repeat = False
+            self.max_cycles = 1
+        if triage_input is not None:
+            if not decisions_only:
+                raise ValueError("frozen triage input requires decisions-only mode")
+            # Frozen triage sitting: the plan is an input, so the run never
+            # repeats or re-triages; prompting stays as the caller asked.
             self.repeat = False
             self.max_cycles = 1
         self.state.run_type = "sweep"
@@ -2667,7 +2678,11 @@ class SweepEngine(Engine):
             plan, answers, effect_unlanded=effect_unlanded
         )
         if self.decisions_only:
-            self.journal.append("sweep-decisions-only", bundles_not_run=len(bundles))
+            self.journal.append(
+                "sweep-decisions-only",
+                bundles_not_run=len(bundles),
+                pending_required=len(plan.decisions),
+            )
             self._prune_pre_answers()
             self._emit("post_sweep_cycle", phase=str(cycle))
             return False
@@ -5056,6 +5071,8 @@ class SweepEngine(Engine):
             try:
                 cached = _read_json(triage_path)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                if self.triage_input is not None:
+                    raise RuntimeError("persisted triage input evidence is unreadable") from exc
                 self.journal.append("sweep-triage-reload-failed", errors=[f"unreadable: {exc}"])
                 # DW-263: INVALIDATE before re-triaging. This is the one arm where
                 # a VALID plan can be sitting behind a transient fault: the fresh
@@ -5090,8 +5107,28 @@ class SweepEngine(Engine):
                         "cached selected open_ids no longer match the current selector universe"
                     ]
                 if plan is not None:
+                    if self.triage_input is not None and cached != self.triage_input[0]:
+                        raise RuntimeError("persisted triage input evidence was substituted")
                     return plan
+                if self.triage_input is not None:
+                    raise RuntimeError("persisted triage input evidence is invalid")
                 self.journal.append("sweep-triage-reload-failed", errors=errors)
+
+        if self.triage_input is not None:
+            document, plan = self.triage_input
+            # The frozen document stands in for the triage session's result: write
+            # it where a resume reloads it, so the substitution check above holds.
+            atomic_write_text(triage_path, json.dumps(document, indent=2))
+            self.journal.append(
+                "sweep-triage-result",
+                bundles=len(plan.bundles),
+                decisions=len(plan.decisions),
+                already_resolved=len(plan.already_resolved),
+                blocked=len(plan.blocked),
+                skip=len(plan.skip),
+                source="frozen-triage-input",
+            )
+            return plan
 
         task = self.state.tasks.get(triage_key)
         if task is None:
