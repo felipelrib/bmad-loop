@@ -483,9 +483,12 @@ def _copy_xattrs(src: Path, dst: Path) -> None:
         names = listxattr(src)
     except OSError:
         return
+    # Resolve optional Linux APIs only after the existing capability check.
+    setxattr = getattr(os, "setxattr")
+    getxattr = getattr(os, "getxattr")
     for name in names:
         try:
-            os.setxattr(dst, name, os.getxattr(src, name))
+            setxattr(dst, name, getxattr(src, name))
         except OSError:
             continue
 
@@ -1412,6 +1415,10 @@ def open_dir_confined(
     :func:`path_is_confined` documents (DW-295)."""
     if not HANDLE_ANCHORED_WRITES:
         return None
+    # `O_DIRECTORY` exists only on the dir-fd arm; resolve it by name so the
+    # win32 arm (HANDLE_ANCHORED_WRITES without a dir fd) still typechecks and
+    # never touches it at runtime.
+    o_directory = getattr(os, "O_DIRECTORY", 0)
     try:
         relative = target.relative_to(root)
     except ValueError:
@@ -1420,7 +1427,7 @@ def open_dir_confined(
     access = search_access if search_only else os.O_RDONLY
     try:
         if DIR_FD_ANCHORED_WRITES:
-            fd = os.open(root, access | os.O_DIRECTORY)
+            fd = os.open(root, access | o_directory)
         else:
             fd = win32_at.open_directory(root)
     except OSError:

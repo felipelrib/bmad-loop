@@ -7,6 +7,10 @@ breaking changes may land in a minor release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve optional POSIX APIs after capability checks so native Windows type checking passes.
+
 ## [0.13.1] — 2026-10-01
 
 ### Added
