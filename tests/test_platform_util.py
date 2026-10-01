@@ -1235,3 +1235,23 @@ def test_the_lexical_fallback_keeps_every_bridge_spelling_matchable(spelling):
     pure = PureWindowsPath(spelling)
     assert pure.is_absolute(), "absolute() would prepend a POSIX cwd and destroy the prefix"
     assert platform_util.is_wsl_unc_path(pure) is True
+
+
+def test_platform_helpers_typecheck_for_windows_target():
+    """Keep feature-gated POSIX APIs valid under the native Windows type surface."""
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pyright",
+            "--pythonplatform",
+            "Windows",
+            "src/bmad_loop/platform_util.py",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -318,9 +318,12 @@ def _copy_xattrs(src: Path, dst: Path) -> None:
         names = listxattr(src)
     except OSError:
         return
+    # Resolve optional Linux APIs only after the existing capability check.
+    setxattr = getattr(os, "setxattr")
+    getxattr = getattr(os, "getxattr")
     for name in names:
         try:
-            os.setxattr(dst, name, os.getxattr(src, name))
+            setxattr(dst, name, getxattr(src, name))
         except OSError:
             continue
 
@@ -508,17 +511,20 @@ def open_dir_confined(root: Path, target: Path) -> int | None:
     win32, which has no ``*at()`` family to anchor against."""
     if not DIR_FD_ANCHORED_WRITES:
         return None
+    # These flags exist only on the supported anchored-write platforms.
+    o_directory = getattr(os, "O_DIRECTORY")
+    o_nofollow = getattr(os, "O_NOFOLLOW")
     try:
         relative = target.relative_to(root)
     except ValueError:
         return None  # not under root at all
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(root, os.O_RDONLY | o_directory)
     except OSError:
         return None
     for part in relative.parts:
         try:
-            nested = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            nested = os.open(part, os.O_RDONLY | o_directory | o_nofollow, dir_fd=fd)
         except OSError:
             os.close(fd)
             return None  # a link, a missing component, or one we cannot probe
