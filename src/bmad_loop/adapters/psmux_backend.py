@@ -50,6 +50,13 @@ the ``_run`` override, the one place psmux is spawned.
 ``available()`` additionally gates on the
 reported version —
 see ``_LAST_UNSUPPORTED`` for what the floor buys and why it moves.
+A window
+target that no longer resolves is not refused either: ``kill-window`` exits 0
+and destroys the session's *active* window, and ``list-panes`` answers for
+that window — so ``kill_window`` and ``window_pane_pids`` identify the window
+first and never send a target they cannot find; and ``new-window -P`` can exit
+0 without printing an id, which ``new_window`` verifies or retries instead of
+returning — see the ``window identity before a destructive verb`` block.
 ``has_session``
 is inherited unchanged, but one server per session gives it a residual the
 tmux path does not have: a ``-t`` read resolves through the named port and key
@@ -79,6 +86,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -197,6 +205,10 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         """
         self._default_registry = default_registry
         self._registry_root = None if default_registry else registry_root
+        # Qualified id -> name of every agent window this instance minted and
+        # has not yet seen die: the second attribute `_locate` checks before a
+        # destructive verb (see the window-identity block).
+        self._minted_names: dict[str, str] = {}
 
     def _run(
         self,
@@ -558,8 +570,67 @@ class PsmuxMultiplexer(BaseTmuxBackend):
         # downstream `-t` consumer inherits an unambiguous target. Post-process
         # the base's return rather than reformatting `-F` so the argv stays
         # byte-identical to the base's.
-        window_id = super().new_window(session, name, cwd, env, command)
-        return self._qualified_window_id(session, window_id)
+        #
+        # `new-window -P` can exit 0 and print NO id (observed on 3.3.7 under
+        # load). Returning that would hand every consumer an empty `-t`: the
+        # tee fails with "no server running on session ''" and the session is
+        # read as a crash that never ran. So an answer that is not a window id
+        # is never returned — the window is looked for by what only this call
+        # could have made (an id absent from the pre-launch snapshot, carrying
+        # this name), creation is retried only once the listing proves nothing
+        # was made, and a mint that cannot be confirmed either way raises the
+        # seam type. Never a blind retry: that is a second agent in one tree.
+        self._window_launch(env, command)  # refuse a malformed launch before any spawn
+        before = {row[0] for row in self._window_rows(session)}
+        for _ in range(self._MINT_ATTEMPTS):
+            window_id = super().new_window(session, name, cwd, env, command)
+            if not self._BARE_ID.fullmatch(window_id):
+                window_id = self._find_minted(session, name, before, window_id)
+            if window_id:
+                qualified = self._qualified_window_id(session, window_id)
+                self._minted_names[qualified] = name
+                return qualified
+        raise TmuxError(
+            f"{self._BINARY} new-window on {session} printed no window id in "
+            f"{self._MINT_ATTEMPTS} attempts and created no window named {name!r}"
+        )
+
+    def _find_minted(self, session: str, name: str, before: set[str], answer: str) -> str:
+        """Bare id of the window a ``new-window`` that printed no usable id just
+        made, or ``""`` when the listing proves it made none (safe to retry).
+
+        Raises :class:`TmuxError` when that cannot be told: the pre-launch
+        snapshot or every listing here came back empty (a live session always
+        lists its keep-alive window, so empty is a failed read), or more than
+        one new window carries the name."""
+        if not before:
+            raise TmuxError(
+                f"{self._BINARY} new-window on {session} printed no window id "
+                f"({answer!r}) and the session's windows could not be listed "
+                "beforehand, so whether a window was created is unknowable"
+            )
+        what = f"{self._BINARY} new-window on {session} printed no window id ({answer!r})"
+        listed = False
+        for attempt in range(self._VERIFY_ATTEMPTS):
+            if attempt:
+                time.sleep(self._VERIFY_INTERVAL_S)
+            rows = self._window_rows(session)
+            listed = listed or bool(rows)
+            ours = [
+                win_id for win_id, win_name in rows if win_id not in before and win_name == name
+            ]
+            if len(ours) > 1:
+                raise TmuxError(f"{what} and several new windows are named {name!r}")
+            if ours:
+                print(f"warning: {what}; adopted {ours[0]} by its name {name!r}", file=sys.stderr)
+                return ours[0]
+        if not listed:
+            raise TmuxError(
+                f"{what} and the session's windows could not be listed, so "
+                "whether a window was created is unknowable"
+            )
+        print(f"warning: {what} and created no window named {name!r}", file=sys.stderr)
+        return ""
 
     def list_window_ids(self, session: str) -> list[str]:
         # psmux's list-windows emits bare `@N` lines; qualify them identically
@@ -1009,36 +1080,153 @@ class PsmuxMultiplexer(BaseTmuxBackend):
             # life, so the failure is at least visible.
             print(f"warning: orphan-key sweep failed on {session}: {exc}", file=sys.stderr)
 
+    # ------------------------- window identity before a destructive verb
+    #
+    # psmux does not refuse a window target it cannot resolve: `kill-window`
+    # exits 0 and destroys the session's ACTIVE window (psmux/psmux#545), and
+    # `list-panes` answers with that window's panes. In an agent session whose
+    # CLI exited by itself, the stale id's "active window" is the keep-alive
+    # shell — so a plain teardown kills the session (it dies ~130 ms later, and
+    # the next launch finds no server), and the kill escalation harvests the
+    # keep-alive shell's pid as if it were the agent's. tmux proper answers a
+    # stale id with an error and never recycles ids, so the base needs none of
+    # this and is left alone.
+    #
+    # Hence: both verbs LOCATE the window first and are sent only when it is
+    # positively there — its id in the session's own listing, and, for a
+    # window this instance minted, still carrying the name it was minted with.
+    # The name is what separates a window from an identically-numbered one on
+    # a recreated server: ids restart with each server and a session name
+    # outlives its server (a `-n` name held through a console-title change and
+    # a rename escape when probed on 3.3.7). A window that is gone is already torn
+    # down, which is all the caller asked for; one that cannot be identified
+    # is left alone, loudly.
+    #
+    # Residue, by construction: the listing and the verb are two round-trips,
+    # so a window that exits between them still takes the stale path. That
+    # window is tens of milliseconds wide instead of the session's lifetime.
+    # A sessionless target (the #221 degrade) cannot be listed at all and
+    # keeps the unverified send.
+
+    #: `new_window` creation attempts when psmux prints no id, and the listing
+    #: reads spent settling each one / an empty pre-kill listing.
+    _MINT_ATTEMPTS = 3
+    _VERIFY_ATTEMPTS = 3
+    _VERIFY_INTERVAL_S = 0.2
+
+    _UNROUTABLE = "unroutable"  # no session in the target: nothing to list
+    _LIVE = "live"  # listed, and still the window that was minted
+    _GONE = "gone"  # verifiably absent (or its whole session is)
+    _UNKNOWN = "unknown"  # listed under another name, or not listable
+
+    def _window_rows(self, session: str) -> list[tuple[str, str]]:
+        """``(bare id, name)`` per window of ``session``; ``[]`` when the
+        listing failed or the session is gone (the base's sentinel)."""
+        # super(): the base emits unqualified ids, the form the keys need.
+        rows = super().list_windows(session, ["window_id", "window_name"])
+        return [(row[0], row[1]) for row in rows]
+
+    def _locate(self, target: str) -> tuple[str, str, str]:
+        """``(verdict, session, id-digits)`` for a window target — see the
+        block comment. ``id-digits`` is ``""`` unless the listing answered for
+        a resolvable id (``_LIVE``, or ``_GONE`` with the session still up)."""
+        match = self._SESSION_WINDOW.fullmatch(target.removeprefix("="))
+        if match is None:
+            return self._UNROUTABLE, "", ""
+        session, window = match["session"], match["window"]
+        rows: list[tuple[str, str]] = []
+        for attempt in range(self._VERIFY_ATTEMPTS):
+            if attempt:
+                time.sleep(self._VERIFY_INTERVAL_S)
+            rows = self._window_rows(session)
+            if rows:
+                break
+            # An empty listing is a failed read or a dead session; only the
+            # latter makes the window gone. has_session's wrong-True residual
+            # (module docstring) lands on _UNKNOWN — the direction that kills
+            # nothing.
+            try:
+                if not self.has_session(session):
+                    self._minted_names.pop(target.removeprefix("="), None)
+                    return self._GONE, session, ""
+            except TmuxError:
+                pass
+        if not rows:
+            return self._UNKNOWN, session, ""
+        digits = self._id_digits(window)
+        if digits:
+            names = [win_name for win_id, win_name in rows if win_id == window]
+        else:  # a name token: resolvable only while the window lives
+            ids = [win_id for win_id, win_name in rows if win_name == window]
+            digits = self._id_digits(ids[0]) if ids else ""
+            names = [window] if ids else []
+        # Keyed as new_window minted it, whichever spelling the target used.
+        key = self._qualified_window_id(session, f"@{digits}")
+        if not names:
+            self._minted_names.pop(key, None)
+            return self._GONE, session, digits
+        minted = self._minted_names.get(key)
+        if minted is not None and names[0] != minted:
+            return self._UNKNOWN, session, digits
+        return self._LIVE, session, digits
+
+    def _warn_unidentified(self, verb: str, target: str) -> None:
+        print(
+            f"warning: {verb} skipped — {target} could not be identified as the "
+            "window it names (its session's windows could not be listed, or the "
+            "id now belongs to a window with another name); on psmux an "
+            "unresolved target acts on the session's active window instead",
+            file=sys.stderr,
+        )
+
+    def window_pane_pids(self, target: str) -> list[int]:
+        # Feeds the kill escalation's harvest and its force-kill: a stale
+        # target must answer the seam's "unknown" [], never the keep-alive
+        # shell's pid.
+        if self._locate(target)[0] not in (self._LIVE, self._UNROUTABLE):
+            return []
+        return super().window_pane_pids(target)
+
     def kill_window(self, target: str) -> None:
-        # Kill first, clean only once the window is verifiably gone: the ctl
-        # session outlives every run, so a leaked key lives as long as the
-        # server — but a kill that FAILS must leave the live window its keys
-        # (the project tag scopes the prune retry; the return key keeps both
-        # return legs armed, see _parked_trailer). Scope resolves before the kill because a name
-        # token cannot be resolved once the window is dead. An empty liveness
-        # listing means the session is gone (#525 narrowed it to that; anything
-        # unproven raises into the arm below), and its keys went with the
-        # server — but this path cannot tell that from the pre-#525 reading, so
-        # it still degrades toward retaining them; the launch-time orphan sweep
-        # reclaims whatever survived once the window is provably gone. Discovery is generic by the seam's marker — the backend must
-        # not know which option names callers use. Best-effort throughout:
-        # cleanup failure warns (the sweep precedent) but never blocks or
-        # fails the kill.
-        # Cost, accepted: two listing round-trips per kill, three for a name
-        # target (name-resolve, liveness, then keys; agent-window kills pay it
-        # too, for nothing — and prune_ctl_windows fans it out once per stale
-        # window), plus one more from the base's survivor probe whenever the
-        # kill exits non-zero — on psmux that includes ordinary window-death
-        # teardown; skip-by-session-name if that ever measures.
-        scope = self._option_scope(target)
-        super().kill_window(target)
-        if scope is None:
+        # Identify, kill, then clean only once the window is verifiably gone:
+        # the ctl session outlives every run, so a leaked key lives as long as
+        # the server — but a kill that FAILS must leave the live window its
+        # keys (the project tag scopes the prune retry; the return key keeps both
+        # return legs armed, see _parked_trailer). The window is located before
+        # the kill both because the kill must not be sent at a target that no
+        # longer resolves (the block above) and because a name token cannot be
+        # resolved once the window is dead. An empty liveness listing means the
+        # session is gone (#525 narrowed it to that; anything unproven raises
+        # into the arm below), and its keys went with the server — but this path
+        # cannot tell that from the pre-#525 reading, so it still degrades toward
+        # retaining them; the launch-time orphan sweep reclaims whatever survived
+        # once the window is provably gone. Discovery is generic by the seam's
+        # marker — the backend must not know which option names callers use.
+        # Best-effort throughout: cleanup failure warns (the sweep precedent) but
+        # never blocks or fails the kill.
+        # Cost, accepted: three listing round-trips per kill (identity, liveness,
+        # then keys; agent-window kills pay it too — and prune_ctl_windows fans
+        # it out once per stale window), plus one more from the base's survivor
+        # probe whenever the kill exits non-zero — on psmux that includes
+        # ordinary window-death teardown; skip-by-session-name if that ever
+        # measures.
+        verdict, session, digits = self._locate(target)
+        if verdict == self._UNROUTABLE:
+            super().kill_window(target)
             return
-        session, digits = scope
+        if verdict == self._UNKNOWN:
+            self._warn_unidentified("kill-window", target)
+            return
+        if verdict == self._LIVE:
+            super().kill_window(target)
+        if not digits:
+            return  # the session is gone, and its option map with it
         try:
-            live = super().list_window_ids(session)  # base = bare ids
-            if not live or f"@{digits}" in live:
-                return
+            if verdict == self._LIVE:
+                live = super().list_window_ids(session)  # base = bare ids
+                if not live or f"@{digits}" in live:
+                    return
+                self._minted_names.pop(self._qualified_window_id(session, f"@{digits}"), None)
             options = self._scoped_options(session)
             if options is None:
                 # Transport failure, not "no keys" — the keys of a verified-

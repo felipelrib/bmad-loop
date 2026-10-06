@@ -148,6 +148,56 @@ def test_prune_kills_only_the_owning_projects_window(tmp_path: Path, monkeypatch
             print(f"warning: {exc}", file=sys.stderr)
 
 
+def test_teardown_of_a_self_exited_window_leaves_the_session_standing(tmp_path: Path):
+    """The agent-session shape: a keep-alive window plus one window whose
+    command exits by itself, then the teardown the adapter runs regardless.
+
+    Unguarded, the stale ``kill-window`` lands on the keep-alive window (the
+    premise probe at the bottom of this file) and the session dies ~130 ms
+    later — so the next launch finds no server. ``exit 0`` under pwsh: zero
+    tokens, like every window this file opens."""
+    mux = PsmuxMultiplexer()
+    if not mux.available():
+        pytest.skip("psmux present but not an admitted version")
+    session = f"bmad-loop-test-{uuid.uuid4().hex[:8]}"
+    exits = 'pwsh -NoProfile -Command "exit 0"'
+    body_ok = False
+    try:
+        mux.new_session(session, tmp_path)
+        keep_alive = mux.list_window_ids(session)
+        assert len(keep_alive) == 1, keep_alive
+        window = mux.new_window(session, "self-exit", tmp_path, {}, exits)
+        assert re.fullmatch(r"[^:]+:@\d+", window), window
+        deadline = time.monotonic() + 30
+        while mux.window_alive(session, window):
+            assert time.monotonic() < deadline, "the self-exiting window never closed"
+            time.sleep(0.1)
+
+        # The two verbs the adapter's teardown sends at the stale id.
+        assert mux.window_pane_pids(window) == []  # not the keep-alive shell's pid
+        mux.kill_window(window)
+
+        # Past the ~130 ms the session used to take to die, with margin.
+        time.sleep(1.5)
+        assert mux.has_session(session), "the stale teardown took the session down"
+        assert mux.list_window_ids(session) == keep_alive
+        # ...and the back-to-back launch a retry makes finds its server.
+        again = mux.new_window(session, "self-exit", tmp_path, {}, exits)
+        assert re.fullmatch(r"[^:]+:@\d+", again) and again != window, again
+        body_ok = True
+    finally:
+        mux.kill_session(session)
+        try:
+            leaked = mux.has_session(session)
+        except tmux_base.TmuxError:
+            leaked = True
+        if leaked:
+            note = f"live-gate session {session} survived teardown; kill it manually"
+            if body_ok:
+                pytest.fail(note)
+            print(f"warning: {note}", file=sys.stderr)
+
+
 # --------------------------------------------------------------- premise probes
 
 
