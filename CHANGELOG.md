@@ -11,6 +11,19 @@ breaking changes may land in a minor release.
 
 - Resolve optional POSIX APIs after capability checks so native Windows type checking passes.
 
+- **psmux: tearing down an agent window that already exited no longer kills the session.** psmux
+  answers a window target it cannot resolve by acting on the session's active window, so the
+  teardown's `kill-window` took the keep-alive window — and the session — down, and the next launch
+  crashed on `no server running` or burned a retry as a lost session. `kill_window` and
+  `window_pane_pids` now identify the window first (its id in the session's listing, and for a
+  window this process minted the name it was minted with) and send nothing at a window that is gone
+  or cannot be identified. tmux is unchanged.
+
+- **psmux: a `new-window` that prints no window id is no longer accepted.** The window is looked up
+  by the name it was just given, creation is retried (three attempts) only once the listing proves
+  nothing was made, and a mint that cannot be confirmed raises `MultiplexerError` instead of handing
+  an empty `-t` target to `pipe-pane`.
+
 ## [0.10.0] — 2026-08-14
 
 Much of this section is the `release/0.9.x` hotfix line brought forward onto `main` (#433).

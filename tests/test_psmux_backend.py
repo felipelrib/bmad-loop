@@ -73,6 +73,7 @@ def test_run_decodes_utf8_with_backslashreplace(rec):
 
 
 def test_new_window_ships_env_and_command_as_encoded_pwsh(rec, tmp_path):
+    rec.stdout = "@2\n"  # a mint that prints no id is verified or retried, never returned
     PsmuxMultiplexer().new_window(
         "s", "n", tmp_path, {"A": "x y", "B": "it's"}, "claude -p 'hi there'"
     )
@@ -133,6 +134,7 @@ def test_new_parked_window_rejects_empty_argv(rec, tmp_path):
 def test_new_window_literalizes_shell_operators(rec, tmp_path):
     # the seam's `command` is a POSIX-quoted argv join, not a shell line: pwsh
     # re-quoting turns would-be operators into literal arguments
+    rec.stdout = "@2\n"
     PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "a && b | c")
     source = _pwsh_payload(rec.argv)
     assert source.endswith("& 'a' '&&' 'b' '|' 'c'")
@@ -150,6 +152,7 @@ def test_new_window_env_values_stay_inert_literals(rec, tmp_path):
         "E": "",
         "F": "'; Remove-Item -Recurse 'C:\\ #",
     }
+    rec.stdout = "@2\n"
     PsmuxMultiplexer().new_window("s", "n", tmp_path, hostile, "prog")
     source = _pwsh_payload(rec.argv)
     for key, value in hostile.items():
@@ -212,11 +215,11 @@ def test_qualification_degrades_to_bare_on_colon_session(monkeypatch, tmp_path):
     assert mux.list_window_ids("a:b") == ["@1", "@2"]
 
 
-def test_new_window_falsy_id_passes_through_unqualified(monkeypatch, tmp_path):
-    # An empty minted id is a failure sentinel, not a target — qualifying it
-    # would forge "s:" out of nothing.
-    _window_fake(monkeypatch, new_window_id="")
-    assert PsmuxMultiplexer().new_window("s", "n", tmp_path, {}, "prog") == ""
+def test_qualification_passes_a_falsy_id_through_unqualified():
+    # An empty id is a failure sentinel, not a target — qualifying it would
+    # forge "s:" out of nothing. new_window itself never returns one any more:
+    # see the "window identity before a destructive verb" tests below.
+    assert PsmuxMultiplexer._qualified_window_id("s", "") == ""
 
 
 def test_window_alive_accepts_new_window_id(monkeypatch, tmp_path):
@@ -1014,13 +1017,18 @@ def test_kill_window_frees_only_that_windows_keys(monkeypatch):
     recorder = _RecordRun()
 
     def fake(argv, **kwargs):
+        # Stateful: @3 is listed until the kill lands — the identity listing
+        # before the kill must find it, the liveness listing after must not.
+        killed = any(c[0][1] == "kill-window" for c in recorder.calls)
         recorder.calls.append((argv, kwargs))
-        out = {"show-options": listing, "list-windows": "@1\n@13\n"}.get(argv[1], "")
+        windows = "@1\n@13\n" if killed else "@1\n@3\n@13\n"
+        out = {"show-options": listing, "list-windows": windows}.get(argv[1], "")
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().kill_window("ctl:@3")
-    assert recorder.calls[0][0][1:] == ["kill-window", "-t", "ctl:@3"]
+    assert [c[0][1] for c in recorder.calls[:2]] == ["list-windows", "kill-window"]
+    assert recorder.calls[1][0][1:] == ["kill-window", "-t", "ctl:@3"]
     unset = [c[0][5] for c in recorder.calls if c[0][1] == "set-option"]
     assert sorted(unset) == ["@bmad_project__blw@3", "@bmad_return_pane__blw@3"]
 
@@ -1050,13 +1058,16 @@ def test_kill_window_name_target_resolves_scope_before_the_kill(monkeypatch):
     assert [c[5] for c in calls if c[1] == "set-option"] == ["@bmad_project__blw@3"]
 
 
-def test_kill_window_sends_the_kill_when_the_scope_lookup_dies(monkeypatch):
-    # Resolving a name target costs a listing round-trip, and it happens BEFORE
-    # the kill (a name is unresolvable once the window is dead) — so a dead
-    # probe there must not cost the kill. It cannot: the base list_windows
-    # swallows transport failures to [], so the scope degrades to None and the
-    # kill goes out unscoped, leaving the keys to the orphan sweep. Pinned
-    # because the ordering makes the opposite reading plausible on sight.
+def test_kill_window_sends_no_kill_when_the_identity_lookup_dies(monkeypatch, capsys):
+    # Locating the window costs a listing round-trip BEFORE the kill, and a
+    # dead probe there costs the kill — deliberately. psmux does not refuse a
+    # target it cannot resolve: it kills the session's ACTIVE window instead
+    # (psmux/psmux#545), so a kill sent blind at a window that is already gone
+    # takes down whatever is left — in an agent session the keep-alive shell,
+    # and the session with it. This test pinned the opposite ("the kill goes
+    # out unscoped") until that was observed. The base list_windows still
+    # swallows the transport failure to [], which now reads "cannot identify".
+    monkeypatch.setattr(PsmuxMultiplexer, "_VERIFY_INTERVAL_S", 0, raising=False)
     sent = []
 
     def fake(argv, **kwargs):
@@ -1067,7 +1078,8 @@ def test_kill_window_sends_the_kill_when_the_scope_lookup_dies(monkeypatch):
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().kill_window("=ctl:run-abc")  # must not raise
-    assert [c[1] for c in sent] == ["kill-window"]
+    assert "kill-window" not in [c[1] for c in sent]
+    assert "kill-window skipped" in capsys.readouterr().err
 
 
 def test_kill_window_failed_kill_retains_the_keys(monkeypatch):
@@ -1095,12 +1107,16 @@ def test_kill_window_unverifiable_liveness_retains_the_keys(monkeypatch):
 
     def fake(argv, **kwargs):
         recorder.calls.append((argv, kwargs))
+        # The identity listing (id + name) answers; the post-kill liveness
+        # listing (ids only) is the probe that fails.
+        if argv[1] == "list-windows" and "#{window_name}" in argv[-1]:
+            return subprocess.CompletedProcess(argv, 0, stdout="@1\tsh\n@3\trun\n", stderr="")
         rc = 1 if argv[1] == "list-windows" else 0
         return subprocess.CompletedProcess(argv, rc, stdout="", stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().kill_window("ctl:@3")
-    assert [c[0][1] for c in recorder.calls] == ["kill-window", "list-windows"]
+    assert [c[0][1] for c in recorder.calls] == ["list-windows", "kill-window", "list-windows"]
 
 
 def test_failed_kill_leaves_ownership_readable_for_the_prune_retry(monkeypatch):
@@ -1168,13 +1184,14 @@ def test_kill_window_cleanup_failure_never_fails_the_kill(monkeypatch):
     def fake(argv, **kwargs):
         if argv[1] == "show-options":
             raise subprocess.TimeoutExpired(argv, 1)
+        killed = any(c[1] == "kill-window" for c in sent)
         sent.append(argv)
-        out = "@1\n" if argv[1] == "list-windows" else ""
+        out = ("@1\n" if killed else "@1\n@3\n") if argv[1] == "list-windows" else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(tmux_base.subprocess, "run", fake)
     PsmuxMultiplexer().kill_window("ctl:@3")  # must not raise
-    assert sent[0][1:] == ["kill-window", "-t", "ctl:@3"]
+    assert sent[1][1:] == ["kill-window", "-t", "ctl:@3"]
 
 
 def test_kill_window_unlistable_options_warns_and_strands_the_keys(monkeypatch, capsys):
@@ -1238,6 +1255,208 @@ def test_kill_window_unroutable_target_skips_cleanup_but_kills(monkeypatch):
     rec_ = _option_fake(monkeypatch)
     PsmuxMultiplexer().kill_window("@3")
     assert [c[0][1] for c in rec_.calls] == ["kill-window"]
+
+
+# ----------------------------------- window identity before a destructive verb
+# psmux answers a window target it cannot resolve by acting on the session's
+# ACTIVE window (psmux/psmux#545): `kill-window` destroys it and `list-panes`
+# reports its pids, both at exit 0. In an agent session whose CLI exited by
+# itself that window is the keep-alive shell, so a stale teardown kills the
+# session. And `new-window -P` can exit 0 without printing an id at all.
+
+
+class _Server:
+    """A scripted psmux server: windows as ``{bare id: name}``, mutated by the
+    verbs a real one would mutate on. ``mint`` scripts what successive
+    ``new-window`` calls print (``None`` = print the id honestly) and
+    ``creates`` whether each one actually makes the window."""
+
+    def __init__(self, windows: dict[str, str], *, alive: bool = True):
+        self.windows = dict(windows)
+        self.alive = alive
+        self.calls: list[list[str]] = []
+        self.mint: list[str | None] = []
+        self.creates: list[bool] = []
+        self.listable = True
+        self._next = 1 + max((int(w[1:]) for w in windows), default=0)
+
+    def verbs(self, verb: str) -> list[list[str]]:
+        return [c for c in self.calls if c[1] == verb]
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv)
+        verb, rc, out = argv[1], 0, ""
+        if verb == "has-session":
+            rc = 0 if self.alive else 1
+        elif verb == "list-windows":
+            if not (self.alive and self.listable):
+                rc = 1
+            elif "#{window_name}" in argv[-1]:
+                out = "".join(f"{wid}\t{name}\n" for wid, name in self.windows.items())
+            else:
+                out = "".join(f"{wid}\n" for wid in self.windows)
+        elif verb == "new-window":
+            wid = f"@{self._next}"
+            if self.creates.pop(0) if self.creates else True:
+                self._next += 1
+                self.windows[wid] = argv[argv.index("-n") + 1]
+            printed = self.mint.pop(0) if self.mint else None
+            out = f"{wid}\n" if printed is None else printed
+        elif verb == "kill-window":
+            wid = argv[3].rpartition(":")[2]
+            # The premise under test: an unresolved target takes the ACTIVE
+            # window (modelled as the last one left) down instead.
+            victim = wid if wid in self.windows else next(reversed(self.windows), None)
+            if victim:
+                del self.windows[victim]
+        elif verb == "list-panes":
+            out = "4242\n"  # psmux answers for the active window when stale
+        return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+
+@pytest.fixture
+def server(monkeypatch):
+    monkeypatch.setattr(PsmuxMultiplexer, "_VERIFY_INTERVAL_S", 0, raising=False)
+
+    def make(windows=None, **kwargs):
+        fake = _Server({"@1": "pwsh"} if windows is None else windows, **kwargs)
+        monkeypatch.setattr(tmux_base.subprocess, "run", fake)
+        return fake
+
+    return make
+
+
+def test_kill_window_never_sends_a_stale_target(server):
+    # The self-exited agent pane: its window is gone, only the keep-alive is
+    # left. The kill must not go out — on psmux it would land on the keep-alive.
+    srv = server({"@1": "pwsh"})
+    PsmuxMultiplexer().kill_window("s:@2")
+    assert srv.verbs("kill-window") == []
+    assert srv.windows == {"@1": "pwsh"}
+
+
+def test_kill_window_kills_the_window_it_identified(server):
+    srv = server({"@1": "pwsh", "@2": "task"})
+    PsmuxMultiplexer().kill_window("s:@2")
+    assert [c[1:] for c in srv.verbs("kill-window")] == [["kill-window", "-t", "s:@2"]]
+    assert srv.windows == {"@1": "pwsh"}
+
+
+def test_kill_window_on_a_dead_session_sends_nothing(server, capsys):
+    # Session gone = window gone = already torn down: no kill, and no warning
+    # either — this is the ordinary end of a run whose session was reaped.
+    srv = server(alive=False)
+    PsmuxMultiplexer().kill_window("s:@2")
+    assert srv.verbs("kill-window") == []
+    assert capsys.readouterr().err == ""
+
+
+def test_kill_window_unlistable_live_session_is_left_alone_loudly(server, capsys):
+    # The listing fails while the session still answers: the window can be
+    # neither found nor ruled out. Bounded re-reads, then no kill, said aloud.
+    srv = server({"@1": "pwsh", "@2": "task"})
+    srv.listable = False
+    PsmuxMultiplexer().kill_window("s:@2")
+    assert srv.verbs("kill-window") == []
+    assert len(srv.verbs("list-windows")) == PsmuxMultiplexer._VERIFY_ATTEMPTS
+    assert "kill-window skipped" in capsys.readouterr().err
+
+
+def test_kill_window_refuses_a_minted_id_now_under_another_name(server, tmp_path, capsys):
+    # Ids restart with each server and a session name outlives its server, so
+    # `s:@2` can come to mean another window entirely. The id alone is not the
+    # window this instance minted; the name it was minted with has to match too.
+    srv = server()
+    mux = PsmuxMultiplexer()
+    minted = mux.new_window("s", "task-a", tmp_path, {}, "prog")
+    assert minted == "s:@2"
+    srv.windows["@2"] = "task-b"  # the session was recreated under the same name
+    mux.kill_window(minted)
+    assert srv.verbs("kill-window") == []
+    assert "kill-window skipped" in capsys.readouterr().err
+    assert mux.window_pane_pids(minted) == []
+
+    srv.windows["@2"] = "task-a"  # the same window after all: the kill goes out
+    mux.kill_window(minted)
+    assert len(srv.verbs("kill-window")) == 1
+
+
+def test_window_pane_pids_answers_unknown_for_a_stale_target(server):
+    # The kill escalation harvests these pids and force-kills them. A stale
+    # target must not be asked: psmux would report the keep-alive shell's pid.
+    srv = server({"@1": "pwsh"})
+    mux = PsmuxMultiplexer()
+    assert mux.window_pane_pids("s:@2") == []
+    assert srv.verbs("list-panes") == []
+    srv.windows["@2"] = "task"
+    assert mux.window_pane_pids("s:@2") == [4242]
+
+
+def test_tmux_proper_keeps_the_unverified_kill(server):
+    # The guard is psmux's: tmux refuses a stale id with an error and never
+    # recycles ids, so the base sends the kill as it always did.
+    srv = server({"@1": "sh"})
+    TmuxMultiplexer().kill_window("@2")
+    assert [c[1] for c in srv.calls] == ["kill-window"]
+
+
+@pytest.mark.parametrize("printed", ["", "  \n", "psmux: warning\n"])
+def test_new_window_adopts_the_window_it_named_when_no_id_is_printed(
+    server, tmp_path, capsys, printed
+):
+    # Exit 0, no usable id — but the window exists. It is found by what only
+    # this call could have made (a new id carrying this name), not relaunched.
+    srv = server()
+    srv.mint = [printed]
+    assert PsmuxMultiplexer().new_window("s", "task", tmp_path, {}, "prog") == "s:@2"
+    assert len(srv.verbs("new-window")) == 1
+    assert "adopted @2" in capsys.readouterr().err
+
+
+def test_new_window_retries_once_the_listing_proves_nothing_was_made(server, tmp_path):
+    srv = server()
+    srv.mint, srv.creates = [""], [False]
+    assert PsmuxMultiplexer().new_window("s", "task", tmp_path, {}, "prog") == "s:@2"
+    assert len(srv.verbs("new-window")) == 2
+
+
+def test_new_window_never_returns_an_empty_id(server, tmp_path):
+    # Bounded, then the seam's typed failure — an empty id handed on becomes
+    # `pipe-pane -t ''` and a session read as a crash that never ran.
+    srv = server()
+    srv.mint, srv.creates = [""] * 5, [False] * 5
+    with pytest.raises(MultiplexerError, match="printed no window id"):
+        PsmuxMultiplexer().new_window("s", "task", tmp_path, {}, "prog")
+    assert len(srv.verbs("new-window")) == PsmuxMultiplexer._MINT_ATTEMPTS
+    assert all(c[3] for c in srv.calls if c[2] == "-t")  # no empty target, ever
+
+
+def test_new_window_does_not_relaunch_when_creation_is_unknowable(server, tmp_path):
+    # No id AND no listing: a window may exist. Retrying blind could put a
+    # second agent in the same tree, so this raises after ONE creation.
+    srv = server()
+    srv.mint = [""]
+    mux = PsmuxMultiplexer()
+    real = mux._window_rows
+    reads = []
+
+    def rows(session):
+        reads.append(session)
+        return real(session) if len(reads) == 1 else []  # only the snapshot answers
+
+    mux._window_rows = rows
+    with pytest.raises(MultiplexerError, match="unknowable"):
+        mux.new_window("s", "task", tmp_path, {}, "prog")
+    assert len(srv.verbs("new-window")) == 1
+
+
+def test_new_window_does_not_adopt_an_older_window_of_the_same_name(server, tmp_path):
+    # Task ids (hence window names) repeat across retries. A same-named window
+    # already present before the launch is not the one this call made.
+    srv = server({"@1": "pwsh", "@2": "task"})
+    srv.mint, srv.creates = [""], [False]
+    assert PsmuxMultiplexer().new_window("s", "task", tmp_path, {}, "prog") == "s:@3"
+    assert len(srv.verbs("new-window")) == 2
 
 
 @pytest.mark.parametrize(
